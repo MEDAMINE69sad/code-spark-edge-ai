@@ -11,7 +11,7 @@ const ExtensionSetup = () => {
         <CardHeader>
           <CardTitle>Extension Code</CardTitle>
           <CardDescription>
-            VS Code extension code that uses a Supabase Edge Function
+            VS Code extension code that uses n8n webhooks for AI functionality
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -20,18 +20,25 @@ const ExtensionSetup = () => {
               <TabsTrigger value="main">Main</TabsTrigger>
               <TabsTrigger value="commands">Commands</TabsTrigger>
               <TabsTrigger value="package">package.json</TabsTrigger>
+              <TabsTrigger value="subscription">Subscription</TabsTrigger>
             </TabsList>
             <TabsContent value="main">
               <CodeViewer language="typescript" code={`import * as vscode from 'vscode';
 import axios from 'axios';
+import { createClient } from '@supabase/supabase-js';
+
+// Initialize Supabase client
+const supabaseUrl = 'YOUR_SUPABASE_URL';
+const supabaseKey = 'YOUR_SUPABASE_ANON_KEY';
+const supabase = createClient(supabaseUrl, supabaseKey);
 
 // Helper function to validate configuration
 function validateConfig(): boolean {
     const config = vscode.workspace.getConfiguration('supaCodeAssistant');
-    const edgeFunctionUrl = config.get<string>('edgeFunctionUrl');
+    const completionWebhook = config.get<string>('completionWebhook');
 
-    if (!edgeFunctionUrl) {
-        vscode.window.showErrorMessage('Please configure your Supabase Edge Function URL in settings');
+    if (!completionWebhook) {
+        vscode.window.showErrorMessage('Please configure your webhook URLs in settings');
         return false;
     }
 
@@ -45,21 +52,93 @@ function handleError(error: Error, message: string): Promise<never> {
     return Promise.reject(error);
 }
 
-// Helper function to call AI via Supabase Edge Function
-async function callAI(systemPrompt: string, userPrompt: string): Promise<string> {
+// User subscription state
+let userSubscription = {
+    active: false,
+    plan: 'free',
+    requestsToday: 0,
+    dailyLimit: 100,
+    model: 'gemini-pro-2.5'
+};
+
+// Check user subscription status
+async function checkSubscription() {
+    try {
+        const session = await supabase.auth.getSession();
+        if (!session.data.session) {
+            userSubscription = {
+                active: false,
+                plan: 'free',
+                requestsToday: 0,
+                dailyLimit: 100,
+                model: 'gemini-pro-2.5'
+            };
+            return;
+        }
+        
+        const { data, error } = await supabase
+            .from('user_subscriptions')
+            .select('*')
+            .eq('user_id', session.data.session.user.id)
+            .single();
+            
+        if (error) {
+            console.error('Error fetching subscription:', error);
+            return;
+        }
+        
+        if (data) {
+            const today = new Date().toISOString().split('T')[0];
+            userSubscription = {
+                active: data.active,
+                plan: data.active ? 'premium' : 'free',
+                requestsToday: data.requests_log && data.requests_log[today] ? data.requests_log[today] : 0,
+                dailyLimit: data.active ? Infinity : 100,
+                model: data.active ? 'gpt-4o' : 'gemini-pro-2.5'
+            };
+        }
+        
+        // Update status bar to reflect subscription
+        updateStatusBar();
+    } catch (error) {
+        console.error('Failed to check subscription:', error);
+    }
+}
+
+// Helper function to call AI via n8n webhook
+async function callAI(webhookUrl: string, systemPrompt: string, userPrompt: string): Promise<string> {
+    if (!userSubscription.active && userSubscription.requestsToday >= userSubscription.dailyLimit) {
+        throw new Error('You have reached your daily limit for free users. Please upgrade to premium.');
+    }
+    
     try {
         const config = vscode.workspace.getConfiguration('supaCodeAssistant');
-        const edgeFunctionUrl = config.get<string>('edgeFunctionUrl');
-        const model = config.get<string>('model') || 'gpt-4o';
         const apiKey = config.get<string>('apiKey') || '';
-
+        const selectedModel = config.get<string>('model') || userSubscription.model;
+        
+        // Check if user is trying to use a premium model on free tier
+        const premiumModels = ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo'];
+        if (!userSubscription.active && premiumModels.includes(selectedModel)) {
+            vscode.window.showWarningMessage('Premium models are only available for subscribers. Using Gemini Pro instead.');
+        }
+        
+        const model = userSubscription.active ? selectedModel : 'gemini-pro-2.5';
+        
+        // Prepare payload for n8n webhook
+        const payload = {
+            systemPrompt: { role: 'system', content: systemPrompt },
+            userPrompt: { role: 'user', content: userPrompt },
+            model: model,
+            subscription: {
+                active: userSubscription.active,
+                plan: userSubscription.plan,
+                requestsToday: userSubscription.requestsToday
+            }
+        };
+        
         const response = await axios.post(
-            edgeFunctionUrl!, 
-            {
-                systemPrompt: { role: 'system', content: systemPrompt },
-                userPrompt: { role: 'user', content: userPrompt },
-                model
-            },
+            webhookUrl,
+            payload,
             {
                 headers: {
                     'Content-Type': 'application/json',
@@ -67,10 +146,23 @@ async function callAI(systemPrompt: string, userPrompt: string): Promise<string>
                 }
             }
         );
-
-        return response.data.content || '';
+        
+        // Increment request count for today
+        const today = new Date().toISOString().split('T')[0];
+        const session = await supabase.auth.getSession();
+        if (session.data.session) {
+            await supabase.rpc('increment_daily_requests', {
+                user_id: session.data.session.user.id,
+                request_date: today
+            });
+        }
+        
+        userSubscription.requestsToday++;
+        updateStatusBar();
+        
+        return response.data.completion || response.data.explanation || response.data.fixed_code || '';
     } catch (error) {
-        throw new Error(\`Failed to communicate with Edge Function: \${error.message}\`);
+        throw new Error(\`Failed to communicate with AI service: \${error.message}\`);
     }
 }
 
@@ -90,6 +182,9 @@ export function activate(context: vscode.ExtensionContext) {
     statusBarItem.show();
     context.subscriptions.push(statusBarItem);
 
+    // Check subscription status on activation
+    checkSubscription();
+
     // Update status bar when settings change
     vscode.workspace.onDidChangeConfiguration((e) => {
         if (e.affectsConfiguration('supaCodeAssistant')) {
@@ -97,18 +192,23 @@ export function activate(context: vscode.ExtensionContext) {
         }
     });
 
-    // Initial status bar update
-    try {
-        updateStatusBar();
-    } catch (error) {
-        console.error('Failed to update status bar:', error);
-    }
-
-    // Register settings command
+    // Register settings and auth commands
     const settingsCommand = vscode.commands.registerCommand('extension.openSettings', () => {
         vscode.commands.executeCommand('workbench.action.openSettings', '@ext:supacode-assistant');
     });
     context.subscriptions.push(settingsCommand);
+    
+    const loginCommand = vscode.commands.registerCommand('extension.login', async () => {
+        // Open login page in browser
+        vscode.env.openExternal(vscode.Uri.parse('https://your-supacode-website.com/login'));
+    });
+    context.subscriptions.push(loginCommand);
+    
+    const upgradeCommand = vscode.commands.registerCommand('extension.upgrade', async () => {
+        // Open upgrade page in browser
+        vscode.env.openExternal(vscode.Uri.parse('https://your-supacode-website.com/pricing'));
+    });
+    context.subscriptions.push(upgradeCommand);
 
     // Register main commands
     const commands = [
@@ -124,7 +224,6 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(...commands);
 
     // Register code lens provider for inline assistance
-    // This is a more advanced feature similar to Copilot
     const codeLensProvider = new SupaCodeLensProvider();
     context.subscriptions.push(
         vscode.languages.registerCodeLensProvider(
@@ -146,8 +245,18 @@ export function activate(context: vscode.ExtensionContext) {
 function updateStatusBar() {
     try {
         const config = vscode.workspace.getConfiguration('supaCodeAssistant');
-        const model = config.get<string>('model') || 'gpt-4o';
-        statusBarItem.text = \`$(sparkle) SupaCode [\${model}]\`;
+        const model = userSubscription.active 
+            ? (config.get<string>('model') || 'gpt-4o')
+            : 'gemini-pro-2.5';
+        
+        const requestInfo = userSubscription.active 
+            ? '' 
+            : ` (${userSubscription.requestsToday}/${userSubscription.dailyLimit})`;
+            
+        const planIcon = userSubscription.active ? '$(star-full)' : '$(star-empty)';
+        
+        statusBarItem.text = \`$(sparkle) SupaCode ${planIcon} [\${model}]\${requestInfo}\`;
+        statusBarItem.tooltip = \`SupaCode AI Assistant - ${userSubscription.active ? 'Premium' : 'Free'} Plan\`;
     } catch (error) {
         console.error('Failed to update status bar text:', error);
         statusBarItem.text = '$(sparkle) SupaCode';
@@ -168,6 +277,9 @@ async function generateCode() {
     const fileName = editor.document.fileName.split('/').pop() || '';
 
     try {
+        const config = vscode.workspace.getConfiguration('supaCodeAssistant');
+        const webhookUrl = config.get<string>('completionWebhook');
+        
         // Allow user to enter a prompt
         const prompt = await vscode.window.showInputBox({ 
             prompt: 'Describe the code you want to generate',
@@ -187,7 +299,9 @@ async function generateCode() {
             title: "Generating code...",
             cancellable: true
         }, async (progress, token) => {
-            const completion = await callAI(systemPrompt, userPromptContent);
+            const completion = await callAI(webhookUrl, systemPrompt, userPromptContent);
+            
+            if (token.isCancellationRequested) return;
             
             // Extract code block if response contains markdown
             let codeToInsert = completion;
@@ -195,8 +309,6 @@ async function generateCode() {
             if (codeBlockMatch && codeBlockMatch[1]) {
                 codeToInsert = codeBlockMatch[1];
             }
-
-            if (token.isCancellationRequested) return;
             
             editor.edit(editBuilder => {
                 if (selection.isEmpty) {
@@ -227,6 +339,9 @@ async function explainCode() {
     const languageId = editor.document.languageId;
 
     try {
+        const config = vscode.workspace.getConfiguration('supaCodeAssistant');
+        const webhookUrl = config.get<string>('explainWebhook');
+        
         const systemPrompt = \`You are a code explainer. Explain the following \${languageId} code in simple terms, focusing on its purpose, functionality, and best practices used.\`;
 
         await vscode.window.withProgress({
@@ -234,7 +349,7 @@ async function explainCode() {
             title: "Explaining code...",
             cancellable: true
         }, async (progress, token) => {
-            const explanation = await callAI(systemPrompt, code);
+            const explanation = await callAI(webhookUrl, systemPrompt, code);
             
             if (token.isCancellationRequested) return;
 
@@ -264,6 +379,9 @@ async function refactorCode() {
     const languageId = editor.document.languageId;
 
     try {
+        const config = vscode.workspace.getConfiguration('supaCodeAssistant');
+        const webhookUrl = config.get<string>('refactorWebhook');
+        
         // Get refactoring options
         const refactoringType = await vscode.window.showQuickPick([
             { label: 'General Improvements', description: 'General code quality improvements' },
@@ -282,7 +400,7 @@ async function refactorCode() {
             title: "Refactoring code...",
             cancellable: true
         }, async (progress, token) => {
-            const refactored = await callAI(systemPrompt, code);
+            const refactored = await callAI(webhookUrl, systemPrompt, code);
             
             if (token.isCancellationRequested) return;
             
@@ -313,6 +431,9 @@ async function generateTests() {
     const languageId = editor.document.languageId;
 
     try {
+        const config = vscode.workspace.getConfiguration('supaCodeAssistant');
+        const webhookUrl = config.get<string>('testWebhook');
+        
         // Get testing framework preference
         const testingFramework = await vscode.window.showQuickPick([
             { label: 'Jest', description: 'Facebook\\'s JavaScript testing framework' },
@@ -329,7 +450,7 @@ async function generateTests() {
             title: "Generating tests...",
             cancellable: true
         }, async (progress, token) => {
-            const tests = await callAI(systemPrompt, code);
+            const tests = await callAI(webhookUrl, systemPrompt, code);
             
             if (token.isCancellationRequested) return;
             
@@ -343,289 +464,13 @@ async function generateTests() {
     } catch (error) {
         handleError(error, 'Failed to generate tests');
     }
-}
-
-async function generateDocumentation() {
-    if (!validateConfig()) return;
-
-    const editor = vscode.window.activeTextEditor;
-    if (!editor) return vscode.window.showInformationMessage('No active editor');
-
-    const selection = editor.selection;
-    if (selection.isEmpty) {
-        vscode.window.showInformationMessage('Please select code to document');
-        return;
-    }
-    
-    const code = editor.document.getText(selection);
-    const languageId = editor.document.languageId;
-
-    try {
-        const systemPrompt = \`You are a documentation assistant. Generate clear, concise, and comprehensive documentation for the following \${languageId} code, following best practices for the language. Use JSDoc style if appropriate for the language.\`;
-
-        await vscode.window.withProgress({
-            location: vscode.ProgressLocation.Notification,
-            title: "Generating documentation...",
-            cancellable: true
-        }, async (progress, token) => {
-            const docs = await callAI(systemPrompt, code);
-            
-            if (token.isCancellationRequested) return;
-            
-            // Extract just the documentation part if it's a markdown response
-            let docsToInsert = docs;
-            const jsDocMatch = docs.match(/\`\`\`(?:\\w+)?\\n([\\s\\S]+?)\\n\`\`\`/);
-            if (jsDocMatch && jsDocMatch[1]) {
-                docsToInsert = jsDocMatch[1];
-            }
-            
-            // Insert at the beginning of the selection
-            const position = new vscode.Position(selection.start.line, selection.start.character);
-            editor.edit(editBuilder => {
-                editBuilder.insert(position, docsToInsert + (docsToInsert.endsWith('\\n') ? '' : '\\n'));
-            });
-        });
-    } catch (error) {
-        handleError(error, 'Failed to generate documentation');
-    }
-}
-
-async function askAI() {
-    if (!validateConfig()) return;
-
-    try {
-        // Get the user's question
-        const question = await vscode.window.showInputBox({ 
-            prompt: 'What would you like to ask?',
-            placeHolder: 'E.g., How do I implement a React context?'
-        });
-        
-        if (!question) return;
-        
-        const editor = vscode.window.activeTextEditor;
-        let context = '';
-        
-        if (editor) {
-            const selection = editor.selection;
-            if (!selection.isEmpty) {
-                context = editor.document.getText(selection);
-            }
-        }
-        
-        const systemPrompt = \`You are a helpful coding assistant that provides clear, concise answers to programming questions.\`;
-        const userPromptContent = context 
-            ? \`Context:\\n\\n\${context}\\n\\nQuestion: \${question}\`
-            : question;
-
-        await vscode.window.withProgress({
-            location: vscode.ProgressLocation.Notification,
-            title: "Thinking...",
-            cancellable: true
-        }, async (progress, token) => {
-            const answer = await callAI(systemPrompt, userPromptContent);
-            
-            if (token.isCancellationRequested) return;
-
-            // Create a markdown preview for better formatting
-            const panel = vscode.window.createWebviewPanel(
-                'supaCodeAnswer',
-                'SupaCode Answer',
-                vscode.ViewColumn.Beside,
-                {
-                    enableScripts: true
-                }
-            );
-            
-            panel.webview.html = \`
-                <!DOCTYPE html>
-                <html>
-                <head>
-                    <meta charset="UTF-8">
-                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                    <style>
-                        body { font-family: Arial, sans-serif; padding: 20px; }
-                        pre { background-color: #f5f5f5; padding: 10px; border-radius: 4px; overflow-x: auto; }
-                        code { font-family: 'Courier New', monospace; }
-                    </style>
-                </head>
-                <body>
-                    <h2>Your Question</h2>
-                    <p>\${question}</p>
-                    <h2>Answer</h2>
-                    <div id="answer">\${answer.replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\\n/g, '<br>').replace(/\`\`\`(.*?)\\n([\\s\\S]*?)\\n\`\`\`/g, '<pre><code>$2</code></pre>')}</div>
-                </body>
-                </html>
-            \`;
-        });
-    } catch (error) {
-        handleError(error, 'Failed to get answer');
-    }
-}
-
-async function fixBugs() {
-    if (!validateConfig()) return;
-
-    const editor = vscode.window.activeTextEditor;
-    if (!editor) return vscode.window.showInformationMessage('No active editor');
-
-    const selection = editor.selection;
-    if (selection.isEmpty) {
-        vscode.window.showInformationMessage('Please select code to fix');
-        return;
-    }
-    
-    const code = editor.document.getText(selection);
-    const languageId = editor.document.languageId;
-
-    try {
-        // Get error description
-        const errorDescription = await vscode.window.showInputBox({ 
-            prompt: 'Describe the error or bug you\\'re experiencing (optional)',
-            placeHolder: 'E.g., TypeError: Cannot read property of undefined'
-        });
-        
-        const systemPrompt = \`You are a bug fixing assistant. Fix bugs in the following \${languageId} code. Only return the fixed code, no explanations.\`;
-        const userPromptContent = errorDescription 
-            ? \`Code with bug:\\n\\n\${code}\\n\\nError: \${errorDescription}\`
-            : \`Code with bug:\\n\\n\${code}\`;
-
-        await vscode.window.withProgress({
-            location: vscode.ProgressLocation.Notification,
-            title: "Fixing bugs...",
-            cancellable: true
-        }, async (progress, token) => {
-            const fixedCode = await callAI(systemPrompt, userPromptContent);
-            
-            if (token.isCancellationRequested) return;
-            
-            // Extract code block if response contains markdown
-            let codeToInsert = fixedCode;
-            const codeBlockMatch = fixedCode.match(/\`\`\`(?:\\w+)?\\n([\\s\\S]+?)\\n\`\`\`/);
-            if (codeBlockMatch && codeBlockMatch[1]) {
-                codeToInsert = codeBlockMatch[1];
-            }
-            
-            editor.edit(editBuilder => {
-                editBuilder.replace(selection, codeToInsert);
-            });
-        });
-    } catch (error) {
-        handleError(error, 'Failed to fix bugs');
-    }
-}
-
-// Code Lens for inline assistance
-class SupaCodeLensProvider implements vscode.CodeLensProvider {
-    async provideCodeLenses(
-        document: vscode.TextDocument, 
-        token: vscode.CancellationToken
-    ): Promise<vscode.CodeLens[]> {
-        const codeLenses: vscode.CodeLens[] = [];
-        
-        // Add CodeLens at function declarations and class declarations
-        const text = document.getText();
-        const functionRegex = /(?:function\\s+(\\w+)|(?:const|let|var)\\s+(\\w+)\\s*=\\s*(?:async\\s*)?\\(.*?\\)\\s*=>|(?:const|let|var)\\s+(\\w+)\\s*=\\s*(?:async\\s*)?function|class\\s+(\\w+))/g;
-        
-        let match;
-        while ((match = functionRegex.exec(text)) !== null) {
-            if (token.isCancellationRequested) return [];
-            
-            const name = match[1] || match[2] || match[3] || match[4];
-            if (!name) continue;
-            
-            const position = document.positionAt(match.index);
-            const range = new vscode.Range(position, position);
-            
-            codeLenses.push(
-                new vscode.CodeLens(range, {
-                    title: "✨ Document",
-                    command: "extension.supaDoc",
-                    tooltip: "Generate documentation for this code"
-                })
-            );
-            
-            codeLenses.push(
-                new vscode.CodeLens(range, {
-                    title: "🔍 Test",
-                    command: "extension.supaTest",
-                    tooltip: "Generate tests for this code"
-                })
-            );
-        }
-        
-        return codeLenses;
-    }
-}
-
-// Inline completion provider
-class SupaCompletionProvider implements vscode.InlineCompletionItemProvider {
-    // Throttle inline completion requests to avoid excessive API calls
-    private lastRequestTime = 0;
-    private readonly THROTTLE_INTERVAL = 3000; // 3 seconds
-    
-    async provideInlineCompletionItems(
-        document: vscode.TextDocument,
-        position: vscode.Position,
-        context: vscode.InlineCompletionContext,
-        token: vscode.CancellationToken
-    ): Promise<vscode.InlineCompletionItem[] | undefined> {
-        // Check if we should skip this request due to throttling
-        const now = Date.now();
-        if (now - this.lastRequestTime < this.THROTTLE_INTERVAL) {
-            return undefined;
-        }
-        
-        // Check if configuration is valid
-        if (!validateConfig()) return undefined;
-        
-        try {
-            // Get context around the cursor
-            const linePrefix = document.lineAt(position.line).text.substring(0, position.character);
-            if (linePrefix.trim().length < 3) return undefined; // Don't suggest if line is almost empty
-            
-            // Get surrounding context
-            const startLine = Math.max(0, position.line - 10);
-            const contextRange = new vscode.Range(startLine, 0, position.line, position.character);
-            const contextText = document.getText(contextRange);
-            
-            // Update last request time
-            this.lastRequestTime = now;
-            
-            const systemPrompt = \`You are a code completion assistant. Predict the next part of the code based on the context. Only respond with the code that should come next, nothing else. Keep it concise.\`;
-            
-            const completion = await callAI(systemPrompt, contextText);
-            
-            // Clean up the completion
-            // Remove any markdown formatting or explanations
-            let cleanCompletion = completion.replace(/\`\`\`(?:\\w+)?(.*?)\`\`\`/gs, '$1').trim();
-            
-            // If completion is too long or seems to be an explanation rather than code, skip it
-            if (cleanCompletion.split('\\n').length > 15 || 
-                cleanCompletion.startsWith('Here') || 
-                cleanCompletion.includes('example')) {
-                return undefined;
-            }
-            
-            return [
-                new vscode.InlineCompletionItem(
-                    cleanCompletion, 
-                    new vscode.Range(position, position)
-                )
-            ];
-        } catch (error) {
-            console.error('Inline completion error:', error);
-            return undefined;
-        }
-    }
-}
-
-export function deactivate() {}`} />
+}`} />
             </TabsContent>
             <TabsContent value="package">
               <CodeViewer language="json" code={`{
   "name": "supacode-assistant",
   "displayName": "SupaCode AI Assistant",
-  "description": "AI code assistant powered by Supabase Edge Functions",
+  "description": "AI code assistant powered by n8n webhooks and Supabase",
   "version": "0.1.0",
   "engines": {
     "vscode": "^1.80.0"
@@ -671,15 +516,53 @@ export function deactivate() {}`} />
       {
         "command": "extension.openSettings",
         "title": "SupaCode: Open Settings"
+      },
+      {
+        "command": "extension.login",
+        "title": "SupaCode: Log In"
+      },
+      {
+        "command": "extension.upgrade",
+        "title": "SupaCode: Upgrade to Premium"
       }
     ],
     "configuration": {
       "title": "SupaCode Assistant",
       "properties": {
-        "supaCodeAssistant.edgeFunctionUrl": {
+        "supaCodeAssistant.completionWebhook": {
           "type": "string",
           "default": "",
-          "description": "URL of your Supabase Edge Function for AI requests"
+          "description": "n8n webhook URL for code completion"
+        },
+        "supaCodeAssistant.fixWebhook": {
+          "type": "string",
+          "default": "",
+          "description": "n8n webhook URL for code fixes"
+        },
+        "supaCodeAssistant.explainWebhook": {
+          "type": "string",
+          "default": "",
+          "description": "n8n webhook URL for code explanation"
+        },
+        "supaCodeAssistant.refactorWebhook": {
+          "type": "string",
+          "default": "",
+          "description": "n8n webhook URL for code refactoring"
+        },
+        "supaCodeAssistant.testWebhook": {
+          "type": "string",
+          "default": "",
+          "description": "n8n webhook URL for test generation"
+        },
+        "supaCodeAssistant.docWebhook": {
+          "type": "string",
+          "default": "",
+          "description": "n8n webhook URL for documentation generation"
+        },
+        "supaCodeAssistant.askWebhook": {
+          "type": "string",
+          "default": "",
+          "description": "n8n webhook URL for general AI questions"
         },
         "supaCodeAssistant.model": {
           "type": "string",
@@ -688,14 +571,15 @@ export function deactivate() {}`} />
             "gpt-4o",
             "gpt-4o-mini",
             "gpt-4-turbo",
-            "gpt-3.5-turbo"
+            "gpt-3.5-turbo",
+            "gemini-pro-2.5"
           ],
-          "description": "AI model to use for code generation"
+          "description": "AI model to use for code generation (premium only)"
         },
         "supaCodeAssistant.apiKey": {
           "type": "string",
           "default": "",
-          "description": "Optional API key for authentication with your Edge Function"
+          "description": "API key for authentication"
         },
         "supaCodeAssistant.inlineCompletions": {
           "type": "boolean",
@@ -752,6 +636,14 @@ export function deactivate() {}`} />
         {
           "command": "extension.supaAsk",
           "group": "4_misc"
+        },
+        {
+          "command": "extension.login",
+          "group": "5_account"
+        },
+        {
+          "command": "extension.upgrade",
+          "group": "5_account"
         }
       ]
     },
@@ -763,7 +655,8 @@ export function deactivate() {}`} />
     ]
   },
   "dependencies": {
-    "axios": "^1.4.0"
+    "axios": "^1.4.0",
+    "@supabase/supabase-js": "^2.39.3"
   },
   "devDependencies": {
     "@types/vscode": "^1.80.0",
@@ -778,6 +671,219 @@ export function deactivate() {}`} />
   }
 }`} />
             </TabsContent>
+            <TabsContent value="subscription">
+              <CodeViewer language="typescript" code={`// SQL Schema for Supabase
+/*
+-- Create subscription and user related tables
+
+-- User subscriptions table
+CREATE TABLE public.user_subscriptions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+    stripe_customer_id TEXT,
+    stripe_subscription_id TEXT,
+    active BOOLEAN DEFAULT false,
+    plan TEXT DEFAULT 'free',
+    requests_log JSONB DEFAULT '{}',
+    current_period_start TIMESTAMPTZ,
+    current_period_end TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now()
+);
+
+-- Function to increment daily request count
+CREATE OR REPLACE FUNCTION increment_daily_requests(user_id UUID, request_date TEXT)
+RETURNS VOID AS $$
+DECLARE
+    current_requests INTEGER;
+    requests_obj JSONB;
+BEGIN
+    -- Get current subscription record
+    SELECT requests_log INTO requests_obj 
+    FROM public.user_subscriptions 
+    WHERE user_id = increment_daily_requests.user_id;
+    
+    -- Initialize if needed
+    IF requests_obj IS NULL THEN
+        requests_obj := '{}'::JSONB;
+    END IF;
+    
+    -- Get current count for today
+    IF (requests_obj ? request_date) THEN
+        current_requests := (requests_obj->>request_date)::INTEGER;
+    ELSE
+        current_requests := 0;
+    END IF;
+    
+    -- Increment count
+    requests_obj := jsonb_set(
+        requests_obj, 
+        ARRAY[request_date], 
+        to_jsonb(current_requests + 1)
+    );
+    
+    -- Update user subscription
+    UPDATE public.user_subscriptions 
+    SET requests_log = requests_obj,
+        updated_at = now()
+    WHERE user_id = increment_daily_requests.user_id;
+    
+    -- Insert a record if none exists (for free users)
+    IF NOT FOUND THEN
+        INSERT INTO public.user_subscriptions (
+            user_id, 
+            active, 
+            plan, 
+            requests_log
+        ) VALUES (
+            increment_daily_requests.user_id,
+            false,
+            'free',
+            jsonb_build_object(request_date, 1)
+        );
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Payment history table
+CREATE TABLE public.payment_history (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+    stripe_invoice_id TEXT,
+    amount DECIMAL(10,2),
+    currency TEXT DEFAULT 'usd',
+    status TEXT,
+    payment_date TIMESTAMPTZ,
+    subscription_id UUID REFERENCES public.user_subscriptions(id),
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+-- Function to reset daily request counts
+-- Create a cron job to run this daily
+CREATE OR REPLACE FUNCTION reset_daily_requests()
+RETURNS VOID AS $$
+BEGIN
+    UPDATE public.user_subscriptions
+    SET requests_log = '{}',
+        updated_at = now();
+END;
+$$ LANGUAGE plpgsql;
+*/
+
+// Supabase Edge Function for Stripe Webhook handler
+/*
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.3"
+import Stripe from "https://esm.sh/stripe@14.21.0"
+
+const stripe = new Stripe(Deno.env.get('STRIPE_SECRET_KEY') || '', {
+  apiVersion: '2023-10-16',
+})
+
+const supabaseUrl = Deno.env.get('SUPABASE_URL') || ''
+const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') || ''
+
+const supabase = createClient(supabaseUrl, supabaseServiceKey)
+
+serve(async (req) => {
+  const signature = req.headers.get('stripe-signature')
+  const webhookSecret = Deno.env.get('STRIPE_WEBHOOK_SECRET')
+  
+  if (!signature || !webhookSecret) {
+    return new Response('Webhook signature missing', { status: 400 })
+  }
+
+  const body = await req.text()
+  let event
+  
+  try {
+    event = stripe.webhooks.constructEvent(body, signature, webhookSecret)
+  } catch (err) {
+    console.error(\`Webhook Error: \${err.message}\`)
+    return new Response(\`Webhook Error: \${err.message}\`, { status: 400 })
+  }
+
+  try {
+    // Handle the event
+    switch (event.type) {
+      case 'customer.subscription.created':
+      case 'customer.subscription.updated':
+        const subscription = event.data.object
+        const { data: userData, error: userError } = await supabase
+          .from('users')
+          .select('id')
+          .eq('stripe_customer_id', subscription.customer)
+          .single()
+        
+        if (userError) throw userError
+        
+        await supabase
+          .from('user_subscriptions')
+          .upsert({
+            user_id: userData.id,
+            stripe_subscription_id: subscription.id,
+            stripe_customer_id: subscription.customer,
+            active: subscription.status === 'active',
+            plan: subscription.items.data[0]?.plan.nickname || 'premium',
+            current_period_start: new Date(subscription.current_period_start * 1000).toISOString(),
+            current_period_end: new Date(subscription.current_period_end * 1000).toISOString(),
+            updated_at: new Date().toISOString()
+          }, {
+            onConflict: 'user_id'
+          })
+        break
+        
+      case 'customer.subscription.deleted':
+        const deletedSubscription = event.data.object
+        await supabase
+          .from('user_subscriptions')
+          .update({
+            active: false,
+            updated_at: new Date().toISOString()
+          })
+          .eq('stripe_subscription_id', deletedSubscription.id)
+        break
+        
+      case 'invoice.payment_succeeded':
+        const invoice = event.data.object
+        if (invoice.subscription) {
+          const { data: subData } = await supabase
+            .from('user_subscriptions')
+            .select('id, user_id')
+            .eq('stripe_subscription_id', invoice.subscription)
+            .single()
+            
+          if (subData) {
+            await supabase
+              .from('payment_history')
+              .insert({
+                user_id: subData.user_id,
+                stripe_invoice_id: invoice.id,
+                amount: invoice.amount_paid / 100,
+                currency: invoice.currency,
+                status: 'paid',
+                payment_date: new Date(invoice.created * 1000).toISOString(),
+                subscription_id: subData.id
+              })
+          }
+        }
+        break
+    }
+
+    return new Response(JSON.stringify({ received: true }), {
+      headers: { 'Content-Type': 'application/json' },
+      status: 200,
+    })
+  } catch (error) {
+    console.error('Error processing webhook:', error)
+    return new Response(JSON.stringify({ error: 'Webhook handler failed' }), {
+      headers: { 'Content-Type': 'application/json' },
+      status: 500,
+    })
+  }
+})
+*/`} />
+            </TabsContent>
           </Tabs>
         </CardContent>
       </Card>
@@ -786,3 +892,4 @@ export function deactivate() {}`} />
 };
 
 export default ExtensionSetup;
+
