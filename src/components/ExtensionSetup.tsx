@@ -191,7 +191,7 @@ async function generateCode() {
             
             // Extract code block if response contains markdown
             let codeToInsert = completion;
-            const codeBlockMatch = completion.match(/\`\`\`(?:\w+)?\n([\s\S]+?)\n\`\`\`/);
+            const codeBlockMatch = completion.match(/\`\`\`(?:\\w+)?\\n([\\s\\S]+?)\\n\`\`\`/);
             if (codeBlockMatch && codeBlockMatch[1]) {
                 codeToInsert = codeBlockMatch[1];
             }
@@ -274,7 +274,7 @@ async function refactorCode() {
         
         if (!refactoringType) return;
 
-        const systemPrompt = \`You are a code refactoring assistant. Improve the following \${languageId} code focusing on ${refactoringType.label}. 
+        const systemPrompt = \`You are a code refactoring assistant. Improve the following \${languageId} code focusing on \${refactoringType.label}. 
         Only provide the refactored code, no explanations. Ensure the refactored code maintains the exact same functionality.\`;
 
         await vscode.window.withProgress({
@@ -288,7 +288,7 @@ async function refactorCode() {
             
             // Extract code block if response contains markdown
             let codeToInsert = refactored;
-            const codeBlockMatch = refactored.match(/\`\`\`(?:\w+)?\n([\s\S]+?)\n\`\`\`/);
+            const codeBlockMatch = refactored.match(/\`\`\`(?:\\w+)?\\n([\\s\\S]+?)\\n\`\`\`/);
             if (codeBlockMatch && codeBlockMatch[1]) {
                 codeToInsert = codeBlockMatch[1];
             }
@@ -315,14 +315,14 @@ async function generateTests() {
     try {
         // Get testing framework preference
         const testingFramework = await vscode.window.showQuickPick([
-            { label: 'Jest', description: 'Facebook\'s JavaScript testing framework' },
+            { label: 'Jest', description: 'Facebook\\'s JavaScript testing framework' },
             { label: 'Mocha', description: 'Feature-rich JavaScript test framework' },
             { label: 'Vitest', description: 'Vite-native testing framework' },
         ], { placeHolder: 'Select testing framework' });
         
         if (!testingFramework) return;
 
-        const systemPrompt = \`You are a test generation assistant. Generate comprehensive unit tests for the following \${languageId} code using the ${testingFramework.label} framework. The tests should cover all edge cases and follow best testing practices.\`;
+        const systemPrompt = \`You are a test generation assistant. Generate comprehensive unit tests for the following \${languageId} code using the \${testingFramework.label} framework. The tests should cover all edge cases and follow best testing practices.\`;
 
         await vscode.window.withProgress({
             location: vscode.ProgressLocation.Notification,
@@ -374,7 +374,7 @@ async function generateDocumentation() {
             
             // Extract just the documentation part if it's a markdown response
             let docsToInsert = docs;
-            const jsDocMatch = docs.match(/\`\`\`(?:\w+)?\n([\s\S]+?)\n\`\`\`/);
+            const jsDocMatch = docs.match(/\`\`\`(?:\\w+)?\\n([\\s\\S]+?)\\n\`\`\`/);
             if (jsDocMatch && jsDocMatch[1]) {
                 docsToInsert = jsDocMatch[1];
             }
@@ -382,7 +382,7 @@ async function generateDocumentation() {
             // Insert at the beginning of the selection
             const position = new vscode.Position(selection.start.line, selection.start.character);
             editor.edit(editBuilder => {
-                editBuilder.insert(position, docsToInsert + (docsToInsert.endsWith('\n') ? '' : '\n'));
+                editBuilder.insert(position, docsToInsert + (docsToInsert.endsWith('\\n') ? '' : '\\n'));
             });
         });
     } catch (error) {
@@ -414,7 +414,7 @@ async function askAI() {
         
         const systemPrompt = \`You are a helpful coding assistant that provides clear, concise answers to programming questions.\`;
         const userPromptContent = context 
-            ? \`Context:\n\n\${context}\n\nQuestion: \${question}\`
+            ? \`Context:\\n\\n\${context}\\n\\nQuestion: \${question}\`
             : question;
 
         await vscode.window.withProgress({
@@ -480,14 +480,14 @@ async function fixBugs() {
     try {
         // Get error description
         const errorDescription = await vscode.window.showInputBox({ 
-            prompt: 'Describe the error or bug you\'re experiencing (optional)',
+            prompt: 'Describe the error or bug you\\'re experiencing (optional)',
             placeHolder: 'E.g., TypeError: Cannot read property of undefined'
         });
         
         const systemPrompt = \`You are a bug fixing assistant. Fix bugs in the following \${languageId} code. Only return the fixed code, no explanations.\`;
         const userPromptContent = errorDescription 
-            ? \`Code with bug:\n\n\${code}\n\nError: \${errorDescription}\`
-            : \`Code with bug:\n\n\${code}\`;
+            ? \`Code with bug:\\n\\n\${code}\\n\\nError: \${errorDescription}\`
+            : \`Code with bug:\\n\\n\${code}\`;
 
         await vscode.window.withProgress({
             location: vscode.ProgressLocation.Notification,
@@ -500,7 +500,7 @@ async function fixBugs() {
             
             // Extract code block if response contains markdown
             let codeToInsert = fixedCode;
-            const codeBlockMatch = fixedCode.match(/\`\`\`(?:\w+)?\n([\s\S]+?)\n\`\`\`/);
+            const codeBlockMatch = fixedCode.match(/\`\`\`(?:\\w+)?\\n([\\s\\S]+?)\\n\`\`\`/);
             if (codeBlockMatch && codeBlockMatch[1]) {
                 codeToInsert = codeBlockMatch[1];
             }
@@ -597,7 +597,7 @@ class SupaCompletionProvider implements vscode.InlineCompletionItemProvider {
             
             // Clean up the completion
             // Remove any markdown formatting or explanations
-            let cleanCompletion = completion.replace(/\`\`\`(?:\w+)?(.*?)\`\`\`/gs, '$1').trim();
+            let cleanCompletion = completion.replace(/\`\`\`(?:\\w+)?(.*?)\`\`\`/gs, '$1').trim();
             
             // If completion is too long or seems to be an explanation rather than code, skip it
             if (cleanCompletion.split('\\n').length > 15 || 
