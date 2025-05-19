@@ -240,27 +240,6 @@ export function activate(context: vscode.ExtensionContext) {
             completionProvider
         )
     );
-}
-
-function updateStatusBar() {
-    try {
-        const config = vscode.workspace.getConfiguration('supaCodeAssistant');
-        const model = userSubscription.active 
-            ? (config.get<string>('model') || 'gpt-4o')
-            : 'gemini-pro-2.5';
-        
-        const requestInfo = userSubscription.active 
-            ? '' 
-            : ` (${userSubscription.requestsToday}/${userSubscription.dailyLimit})`;
-            
-        const planIcon = userSubscription.active ? '$(star-full)' : '$(star-empty)';
-        
-        statusBarItem.text = \`$(sparkle) SupaCode ${planIcon} [\${model}]\${requestInfo}\`;
-        statusBarItem.tooltip = \`SupaCode AI Assistant - ${userSubscription.active ? 'Premium' : 'Free'} Plan\`;
-    } catch (error) {
-        console.error('Failed to update status bar text:', error);
-        statusBarItem.text = '$(sparkle) SupaCode';
-    }
 }`} />
             </TabsContent>
             <TabsContent value="commands">
@@ -292,7 +271,7 @@ async function generateCode() {
 
         const userPromptContent = selection.isEmpty
             ? prompt
-            : \`Based on this context:\n\n\${code}\n\nGenerate code for: \${prompt}\`;
+            : \`Based on this context:\\n\\n\${code}\\n\\nGenerate code for: \${prompt}\`;
 
         await vscode.window.withProgress({
             location: vscode.ProgressLocation.Notification,
@@ -892,4 +871,3 @@ serve(async (req) => {
 };
 
 export default ExtensionSetup;
-
